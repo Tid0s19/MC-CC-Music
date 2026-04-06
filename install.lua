@@ -1,8 +1,8 @@
 -- MC-CC-Music Installer
 -- Run this on your ComputerCraft computer:
---   wget run https://raw.githubusercontent.com/Tid0s19/MC-CC-Music/main/install.lua
+--   wget run https://raw.githubusercontent.com/Tid0s19/MC-CC-Music/claude/computercraft-yt-playlists-0kMxe/install.lua
 
-local url = "https://raw.githubusercontent.com/Tid0s19/MC-CC-Music/main/music.lua"
+local url = "https://raw.githubusercontent.com/Tid0s19/MC-CC-Music/claude/computercraft-yt-playlists-0kMxe/music.lua"
 local filename = "music.lua"
 
 print("MC-CC-Music Installer")
