@@ -50,8 +50,8 @@ local toast_msg = nil
 local toast_timer = nil
 
 -- Visualizer state
-local viz_mode = 0  -- 0=Off, 1=Bars, 2=Wave, 3=Fire, 4=Rain
-local viz_names = { "Off", "Bars", "Wave", "Fire", "Rain" }
+local viz_mode = 0  -- 0=Off, 1=Bars, 2=Wave, 3=Fire, 4=Rain, 5=Aurora
+local viz_names = { "Off", "Bars", "Wave", "Fire", "Rain", "Aurora" }
 local audio_level = 0
 local audio_peak = 0
 local audio_bands = {}
@@ -1504,6 +1504,77 @@ local function drawMatrixRain(mon)
 end
 
 ---------------------------------------------------------------------------
+-- Visualizer 5: Aurora Borealis
+---------------------------------------------------------------------------
+-- blit color hex: 0=white 1=orange 2=magenta 3=lightBlue 4=yellow
+--   5=lime 6=pink 7=gray 8=lightGray 9=cyan a=purple b=blue
+--   c=brown d=green e=red f=black
+local aurora_hex = { "f", "b", "a", "2", "9", "5", "8", "0" }
+-- black -> blue -> purple -> magenta -> cyan -> lime -> lightGray -> white
+
+local function drawAurora(mon)
+    local mw, mh = mon.getSize()
+    local t = os.clock()
+
+    -- Audio drives intensity and wave speed
+    local intensity = 0.4 + audio_level * 2.5
+    local wave_speed = 1.0 + audio_level * 2.0
+    if beat_detected then intensity = intensity + 1.2 end
+
+    -- Split audio into low/high bands for different wave layers
+    local low_e, high_e = 0, 0
+    local half = math.floor(#audio_bands / 2)
+    for i = 1, math.max(1, half) do
+        low_e = low_e + (audio_bands[i] or 0)
+    end
+    for i = half + 1, #audio_bands do
+        high_e = high_e + (audio_bands[i] or 0)
+    end
+    low_e = low_e / math.max(1, half)
+    high_e = high_e / math.max(1, #audio_bands - half)
+
+    -- Precompute x-waves (vertical curtain shapes)
+    local sx = {}
+    for x = 1, mw do
+        sx[x] = math.sin(x * 0.08 + t * wave_speed * 0.7)
+               + math.sin(x * 0.17 + t * wave_speed * 1.4) * (0.5 + high_e * 4)
+    end
+
+    -- Precompute diagonal wave
+    local diag = {}
+    for d = 2, mw + mh do
+        diag[d] = math.sin(d * 0.055 + t * wave_speed * 0.4) * (0.5 + low_e * 5)
+    end
+
+    -- Reusable strings for blit
+    local spaces = string.rep(" ", mw)
+    local fg_str = string.rep("f", mw)
+
+    for y = 1, mh do
+        local sy = math.sin(y * 0.15 + t * wave_speed * 1.1)
+                 + math.sin(y * 0.35 + t * wave_speed * 0.6) * 0.5
+        local bg = ""
+        for x = 1, mw do
+            local v = (sx[x] + sy + diag[x + y]) * intensity * 0.2
+            -- Map roughly -1.5..1.5 range to palette index 1..8
+            local idx = math.floor((v + 1.5) * 2.5) + 1
+            if idx < 1 then idx = 1 elseif idx > #aurora_hex then idx = #aurora_hex end
+            bg = bg .. aurora_hex[idx]
+        end
+        mon.setCursorPos(1, y)
+        mon.blit(spaces, fg_str, bg)
+    end
+
+    -- Song info overlay
+    if now_playing then
+        mon.setCursorPos(2, mh)
+        mon.setBackgroundColor(colors.black)
+        mon.setTextColor(colors.white)
+        mon.write(truncStr(now_playing.name, mw - 2))
+    end
+end
+
+---------------------------------------------------------------------------
 -- Visualizer Loop
 ---------------------------------------------------------------------------
 function visualizerLoop()
@@ -1516,6 +1587,7 @@ function visualizerLoop()
                 elseif viz_mode == 2 then drawWaveform(monitor)
                 elseif viz_mode == 3 then drawCampfire(monitor)
                 elseif viz_mode == 4 then drawMatrixRain(monitor)
+                elseif viz_mode == 5 then drawAurora(monitor)
                 end
             end)
             if not ok then
