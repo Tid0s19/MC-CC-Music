@@ -54,9 +54,13 @@ local viz_mode = 0  -- 0=Off, 1=Bars, 2=Wave, 3=Fire, 4=Rain
 local viz_names = { "Off", "Bars", "Wave", "Fire", "Rain" }
 local audio_level = 0
 local audio_peak = 0
+local audio_bands = {}
+local audio_history = {}
+local beat_detected = false
 local viz_state = {
     bar_heights = {},
-    bar_targets = {},
+    bar_peaks = {},
+    bar_peak_hold = {},
     wave_buf = {},
     fire = nil,
     fire_w = 0,
@@ -1039,34 +1043,42 @@ local function drawSpectrumBars(mon)
     local bar_w = math.floor(mw / num_bars)
     local max_h = mh - 2
 
-    -- Initialize heights if needed
+    -- Initialize if needed
     if #viz_state.bar_heights ~= num_bars then
         viz_state.bar_heights = {}
-        viz_state.bar_targets = {}
+        viz_state.bar_peaks = {}
+        viz_state.bar_peak_hold = {}
         for i = 1, num_bars do
             viz_state.bar_heights[i] = 0
-            viz_state.bar_targets[i] = 0
+            viz_state.bar_peaks[i] = 0
+            viz_state.bar_peak_hold[i] = 0
         end
     end
 
-    -- Update targets based on audio level
-    local level = audio_level
+    -- Use actual per-band energy from audio_bands
+    local beat_boost = beat_detected and 1.4 or 1.0
     for i = 1, num_bars do
-        -- Bell curve centered on middle bars, with randomness
-        local center = num_bars / 2
-        local dist = math.abs(i - center) / center
-        local weight = 1 - dist * 0.4
-        viz_state.bar_targets[i] = level * max_h * weight * (0.4 + math.random() * 0.6)
-    end
+        -- Map bars to audio_bands (audio_bands may have different count)
+        local band_idx = math.floor((i - 1) / num_bars * #audio_bands) + 1
+        band_idx = math.min(band_idx, #audio_bands)
+        local energy = (audio_bands[band_idx] or 0) * max_h * 2.5 * beat_boost
 
-    -- Smooth approach
-    for i = 1, num_bars do
-        local h = viz_state.bar_heights[i]
-        local t = viz_state.bar_targets[i]
-        if t > h then
-            viz_state.bar_heights[i] = h + (t - h) * 0.6
+        -- Instant attack, slow decay
+        if energy > viz_state.bar_heights[i] then
+            viz_state.bar_heights[i] = energy
         else
-            viz_state.bar_heights[i] = h - (h - t) * 0.15  -- slower fall
+            viz_state.bar_heights[i] = viz_state.bar_heights[i] * 0.88
+        end
+
+        -- Peak hold indicator
+        if viz_state.bar_heights[i] > viz_state.bar_peaks[i] then
+            viz_state.bar_peaks[i] = viz_state.bar_heights[i]
+            viz_state.bar_peak_hold[i] = 12  -- hold for N frames
+        else
+            viz_state.bar_peak_hold[i] = viz_state.bar_peak_hold[i] - 1
+            if viz_state.bar_peak_hold[i] <= 0 then
+                viz_state.bar_peaks[i] = viz_state.bar_peaks[i] * 0.92
+            end
         end
     end
 
@@ -1080,20 +1092,56 @@ local function drawSpectrumBars(mon)
         if bh > max_h then bh = max_h end
         local bx = (i - 1) * bar_w + 1
 
+        -- Main bar
         for row = 0, bh - 1 do
             local y = mh - 1 - row
-            local pct = row / max_h
-            local col
-            if pct > 0.75 then col = bar_colors_top
-            elseif pct > 0.4 then col = bar_colors_mid
-            else col = bar_colors_bottom end
+            if y >= 1 then
+                local pct = row / max_h
+                local col
+                if pct > 0.75 then col = bar_colors_top
+                elseif pct > 0.4 then col = bar_colors_mid
+                else col = bar_colors_bottom end
 
-            mon.setBackgroundColor(col)
-            for bxx = bx, math.min(bx + bar_w - 2, mw) do
-                mon.setCursorPos(bxx, y)
-                mon.write(" ")
+                mon.setBackgroundColor(col)
+                for bxx = bx, math.min(bx + bar_w - 2, mw) do
+                    mon.setCursorPos(bxx, y)
+                    mon.write(" ")
+                end
             end
         end
+
+        -- Dim reflection (bottom 3 rows mirrored)
+        for row = 0, math.min(2, bh - 1) do
+            local y = mh - 1 + row + 1
+            if y <= mh and y >= 1 then
+                mon.setBackgroundColor(colors.gray)
+                for bxx = bx, math.min(bx + bar_w - 2, mw) do
+                    mon.setCursorPos(bxx, y)
+                    mon.write(" ")
+                end
+            end
+        end
+
+        -- Peak hold dot
+        local pk = math.floor(viz_state.bar_peaks[i] + 0.5)
+        if pk > 0 and pk <= max_h then
+            local py = mh - 1 - pk
+            if py >= 1 then
+                mon.setBackgroundColor(colors.white)
+                for bxx = bx, math.min(bx + bar_w - 2, mw) do
+                    mon.setCursorPos(bxx, py)
+                    mon.write(" ")
+                end
+            end
+        end
+    end
+
+    -- Beat flash
+    if beat_detected then
+        mon.setBackgroundColor(colors.black)
+        mon.setTextColor(colors.white)
+        mon.setCursorPos(mw - 1, 1)
+        mon.write("\7")
     end
 
     -- Song info at bottom
@@ -1106,61 +1154,108 @@ local function drawSpectrumBars(mon)
 end
 
 ---------------------------------------------------------------------------
--- Visualizer 2: Waveform
+-- Visualizer 2: Waveform (triggered oscilloscope)
 ---------------------------------------------------------------------------
 local function drawWaveform(mon)
     local mw, mh = mon.getSize()
     local center_y = math.floor(mh / 2)
+    local amplitude = math.floor(mh / 2) - 1
 
-    -- Add new samples from buffer to wave history
+    -- Build display buffer using trigger-synced oscilloscope approach
+    local wave = {}
     if buffer and #buffer > 0 then
-        -- Sample buffer at regular intervals to fill monitor width
-        local step = math.max(1, math.floor(#buffer / mw))
-        viz_state.wave_buf = {}
-        for i = 1, mw do
-            local idx = math.min((i - 1) * step + 1, #buffer)
-            viz_state.wave_buf[i] = buffer[idx] or 0
+        -- Find a positive zero-crossing to sync/stabilize the display
+        local trigger = 1
+        for i = 2, math.min(#buffer, 2000) do
+            if buffer[i - 1] <= 0 and buffer[i] > 0 then
+                trigger = i
+                break
+            end
         end
+
+        -- Zoom: show ~4 samples per pixel for visible wave detail
+        local spp = math.max(2, math.floor(#buffer / mw / 3))
+        for x = 1, mw do
+            local idx = trigger + (x - 1) * spp
+            if idx >= 1 and idx <= #buffer then
+                wave[x] = buffer[idx] / 128
+            else
+                wave[x] = 0
+            end
+        end
+        viz_state.wave_buf = wave
+    else
+        wave = viz_state.wave_buf or {}
     end
 
     mon.setBackgroundColor(colors.black)
     mon.clear()
 
-    -- Draw center line
-    mon.setTextColor(colors.gray)
-    for x = 1, mw do
-        mon.setCursorPos(x, center_y)
-        mon.write("\140")
+    -- Beat flash background
+    if beat_detected then
+        for x = 1, mw do
+            mon.setCursorPos(x, center_y)
+            mon.setBackgroundColor(colors.gray)
+            mon.write(" ")
+        end
+        mon.setBackgroundColor(colors.black)
+    else
+        -- Draw center line
+        mon.setTextColor(colors.gray)
+        for x = 1, mw do
+            mon.setCursorPos(x, center_y)
+            mon.write("\140")
+        end
     end
 
-    -- Draw waveform
-    if viz_state.wave_buf and #viz_state.wave_buf > 0 then
-        local amplitude = math.floor(mh / 2) - 1
-        for x = 1, math.min(mw, #viz_state.wave_buf) do
-            local sample = viz_state.wave_buf[x] or 0
-            local h = math.floor(sample / 128 * amplitude + 0.5)
-            local y = center_y - h
+    -- Draw waveform with glow
+    if #wave > 0 then
+        for x = 1, math.min(mw, #wave) do
+            local sample = wave[x] or 0
+            local h = math.floor(sample * amplitude + 0.5)
+            local target_y = center_y - h
 
-            -- Draw a vertical line from center to sample point
-            local col = colors.cyan
-            if math.abs(h) > amplitude * 0.8 then col = colors.red
-            elseif math.abs(h) > amplitude * 0.5 then col = colors.yellow end
+            -- Intensity based on displacement
+            local intensity = math.abs(h) / amplitude
+            local col
+            if intensity > 0.8 then col = colors.red
+            elseif intensity > 0.5 then col = colors.yellow
+            else col = colors.cyan end
 
-            mon.setBackgroundColor(col)
+            -- Draw filled bar from center to point
             if h > 0 then
-                for dy = center_y, y, -1 do
+                for dy = center_y - 1, math.max(1, target_y), -1 do
                     mon.setCursorPos(x, dy)
+                    mon.setBackgroundColor(dy == target_y and col or colors.blue)
                     mon.write(" ")
                 end
             elseif h < 0 then
-                for dy = center_y, y do
+                for dy = center_y + 1, math.min(mh, target_y) do
                     mon.setCursorPos(x, dy)
+                    mon.setBackgroundColor(dy == target_y and col or colors.blue)
                     mon.write(" ")
                 end
-            else
-                mon.setCursorPos(x, center_y)
+            end
+
+            -- Bright tip
+            if target_y >= 1 and target_y <= mh then
+                mon.setCursorPos(x, target_y)
+                mon.setBackgroundColor(col)
                 mon.write(" ")
             end
+        end
+    end
+
+    -- VU meter bar at top
+    local vu_w = math.floor(audio_level * mw)
+    if vu_w > 0 then
+        for x = 1, math.min(vu_w, mw) do
+            mon.setCursorPos(x, 1)
+            local pct = x / mw
+            if pct > 0.8 then mon.setBackgroundColor(colors.red)
+            elseif pct > 0.5 then mon.setBackgroundColor(colors.yellow)
+            else mon.setBackgroundColor(colors.green) end
+            mon.write(" ")
         end
     end
 
@@ -1168,7 +1263,7 @@ local function drawWaveform(mon)
     mon.setBackgroundColor(colors.black)
     mon.setTextColor(colors.white)
     if now_playing then
-        mon.setCursorPos(2, 1)
+        mon.setCursorPos(2, mh)
         mon.write(truncStr(now_playing.name, mw - 2))
     end
 end
@@ -1353,9 +1448,10 @@ local function drawMatrixRain(mon)
         end
     end
 
-    -- Speed based on audio
-    local speed = 1 + math.floor(audio_level * 2)
-    local density = 0.3 + audio_level * 0.5
+    -- Speed and density react to audio + beats
+    local speed = 1 + math.floor(audio_level * 3)
+    local density = 0.3 + audio_level * 0.6
+    if beat_detected then speed = speed + 2; density = 1.0 end
 
     mon.setBackgroundColor(colors.black)
     mon.clear()
@@ -1451,9 +1547,14 @@ function visualizerLoop()
             end)
         end
 
-        -- Decay audio level when not getting new data
-        audio_level = audio_level * 0.85
-        audio_peak = audio_peak * 0.95
+        -- Decay audio level between chunks (gentle so bars don't vanish)
+        audio_level = audio_level * 0.93
+        audio_peak = audio_peak * 0.96
+        -- Decay bands individually
+        for i = 1, #audio_bands do
+            audio_bands[i] = (audio_bands[i] or 0) * 0.90
+        end
+        beat_detected = false
 
         sleep(0.05)  -- ~20 FPS
     end
@@ -1509,14 +1610,36 @@ function audioLoop()
 
                         buffer = decoder(chunk)
 
-                        -- Extract audio level for visualizer
-                        local peak = 0
-                        for idx = 1, #buffer, 16 do
-                            local s = math.abs(buffer[idx])
-                            if s > peak then peak = s end
+                        -- Extract per-band energy for visualizer
+                        local num_bands = 16
+                        local band_size = math.floor(#buffer / num_bands)
+                        local bands = {}
+                        local overall = 0
+                        for b = 1, num_bands do
+                            local sum = 0
+                            local si = (b - 1) * band_size + 1
+                            local ei = math.min(b * band_size, #buffer)
+                            for idx = si, ei, 4 do
+                                local s = buffer[idx] or 0
+                                sum = sum + s * s
+                            end
+                            local rms = math.sqrt(sum / ((ei - si) / 4 + 1)) / 128
+                            bands[b] = rms
+                            overall = overall + rms
                         end
-                        audio_level = peak / 128
+                        audio_bands = bands
+                        audio_level = overall / num_bands
+
+                        -- Peak tracking
                         if audio_level > audio_peak then audio_peak = audio_level end
+
+                        -- Beat detection: compare to rolling average
+                        table.insert(audio_history, 1, audio_level)
+                        if #audio_history > 30 then table.remove(audio_history) end
+                        local avg = 0
+                        for _, h in ipairs(audio_history) do avg = avg + h end
+                        avg = avg / #audio_history
+                        beat_detected = audio_level > avg * 1.5 and audio_level > 0.12
 
                         -- Re-scan speakers periodically (picks up network changes)
                         speakers = findAllSpeakers()
