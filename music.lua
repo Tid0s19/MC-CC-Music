@@ -1509,57 +1509,110 @@ end
 -- blit color hex: 0=white 1=orange 2=magenta 3=lightBlue 4=yellow
 --   5=lime 6=pink 7=gray 8=lightGray 9=cyan a=purple b=blue
 --   c=brown d=green e=red f=black
-local aurora_hex = { "f", "b", "a", "2", "9", "5", "8", "0" }
--- black -> blue -> purple -> magenta -> cyan -> lime -> lightGray -> white
+
+-- Multiple palettes that we blend between based on audio character
+local aurora_palettes = {
+    -- Cool:   black  blue   purple cyan   lime   white
+    { "f", "b", "a", "3", "9", "5", "0" },
+    -- Warm:   black  red    orange yellow lime   white
+    { "f", "e", "1", "4", "5", "8", "0" },
+    -- Neon:   black  purple magenta pink  orange yellow white
+    { "f", "a", "2", "6", "1", "4", "0" },
+    -- Ocean:  black  blue   cyan   lightBlue lime green white
+    { "f", "b", "9", "3", "5", "d", "0" },
+    -- Fire:   black  brown  red    orange yellow white
+    { "f", "c", "e", "1", "4", "0", "0" },
+}
+
+-- Smoothed palette blend value for gradual shifts
+local aurora_blend = 0
+local aurora_blend_target = 0
 
 local function drawAurora(mon)
     local mw, mh = mon.getSize()
     local t = os.clock()
 
     -- Audio drives intensity and wave speed
-    local intensity = 0.4 + audio_level * 2.5
-    local wave_speed = 1.0 + audio_level * 2.0
-    if beat_detected then intensity = intensity + 1.2 end
+    local intensity = 0.35 + audio_level * 3.0
+    local wave_speed = 1.0 + audio_level * 2.5
+    if beat_detected then intensity = intensity + 1.5 end
 
-    -- Split audio into low/high bands for different wave layers
-    local low_e, high_e = 0, 0
-    local half = math.floor(#audio_bands / 2)
-    for i = 1, math.max(1, half) do
+    -- Split audio into low/mid/high bands
+    local low_e, mid_e, high_e = 0, 0, 0
+    local third = math.max(1, math.floor(#audio_bands / 3))
+    for i = 1, third do
         low_e = low_e + (audio_bands[i] or 0)
     end
-    for i = half + 1, #audio_bands do
+    for i = third + 1, third * 2 do
+        mid_e = mid_e + (audio_bands[i] or 0)
+    end
+    for i = third * 2 + 1, #audio_bands do
         high_e = high_e + (audio_bands[i] or 0)
     end
-    low_e = low_e / math.max(1, half)
-    high_e = high_e / math.max(1, #audio_bands - half)
+    low_e = low_e / third
+    mid_e = mid_e / third
+    high_e = high_e / math.max(1, #audio_bands - third * 2)
 
-    -- Precompute x-waves (vertical curtain shapes)
+    -- Pick palette based on audio character (shifts over time + audio)
+    -- Low-heavy = warm/fire, high-heavy = cool/neon, balanced = ocean
+    local palette_val = (low_e - high_e) * 8 + math.sin(t * 0.3) * 1.5
+    if beat_detected then palette_val = palette_val + math.sin(t * 3) * 2 end
+    aurora_blend_target = palette_val
+    aurora_blend = aurora_blend + (aurora_blend_target - aurora_blend) * 0.08
+
+    -- Map blend value to a palette index (1-5) with fractional blending
+    local pi_raw = (aurora_blend + 3) * 0.6 + 1  -- roughly map range to 1..5
+    if pi_raw < 1 then pi_raw = 1 elseif pi_raw > #aurora_palettes then pi_raw = #aurora_palettes end
+    local pi1 = math.floor(pi_raw)
+    local pi2 = math.min(pi1 + 1, #aurora_palettes)
+    local frac = pi_raw - pi1
+    local pal1 = aurora_palettes[pi1]
+    local pal2 = aurora_palettes[pi2]
+
+    -- Build current frame palette by choosing from pal1/pal2 based on frac
+    local pal = {}
+    for i = 1, math.min(#pal1, #pal2) do
+        if math.random() < frac then
+            pal[i] = pal2[i]
+        else
+            pal[i] = pal1[i]
+        end
+    end
+    local pal_len = #pal
+
+    -- Precompute x-waves (vertical curtains) - 3 layers
     local sx = {}
     for x = 1, mw do
         sx[x] = math.sin(x * 0.08 + t * wave_speed * 0.7)
-               + math.sin(x * 0.17 + t * wave_speed * 1.4) * (0.5 + high_e * 4)
+               + math.sin(x * 0.19 + t * wave_speed * 1.5) * (0.4 + high_e * 5)
+               + math.sin(x * 0.04 - t * wave_speed * 0.3) * (0.3 + low_e * 3)
     end
 
-    -- Precompute diagonal wave
+    -- Precompute diagonal wave (reacts to mid frequencies)
     local diag = {}
     for d = 2, mw + mh do
-        diag[d] = math.sin(d * 0.055 + t * wave_speed * 0.4) * (0.5 + low_e * 5)
+        diag[d] = math.sin(d * 0.055 + t * wave_speed * 0.4) * (0.5 + mid_e * 5)
     end
+
+    -- Color offset that shifts the whole palette cyclically with time + audio
+    local color_shift = math.sin(t * 0.5) * 1.2 + low_e * 2
 
     -- Reusable strings for blit
     local spaces = string.rep(" ", mw)
     local fg_str = string.rep("f", mw)
 
     for y = 1, mh do
-        local sy = math.sin(y * 0.15 + t * wave_speed * 1.1)
-                 + math.sin(y * 0.35 + t * wave_speed * 0.6) * 0.5
+        local sy = math.sin(y * 0.13 + t * wave_speed * 1.1)
+                 + math.sin(y * 0.31 + t * wave_speed * 0.6) * 0.6
+                 + math.sin(y * 0.07 - t * 0.8) * (0.3 + mid_e * 2)
         local bg = ""
         for x = 1, mw do
-            local v = (sx[x] + sy + diag[x + y]) * intensity * 0.2
-            -- Map roughly -1.5..1.5 range to palette index 1..8
-            local idx = math.floor((v + 1.5) * 2.5) + 1
-            if idx < 1 then idx = 1 elseif idx > #aurora_hex then idx = #aurora_hex end
-            bg = bg .. aurora_hex[idx]
+            local v = (sx[x] + sy + diag[x + y]) * intensity * 0.18 + color_shift
+            -- Wider mapping for more color spread
+            local idx = math.floor((v + 2.0) * 1.6) + 1
+            -- Wrap around for more variety instead of clamping
+            idx = ((idx - 1) % pal_len) + 1
+            bg = bg .. pal[idx]
         end
         mon.setCursorPos(1, y)
         mon.blit(spaces, fg_str, bg)
