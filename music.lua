@@ -282,11 +282,18 @@ function drawNowPlaying()
     bx = bx + drawBtn(bx, 6, " Skip ", false, has_content) + 1
     bx = bx + drawBtn(bx, 6, " Shuf ", false, #queue > 1) + 1
     if looping == 0 then
-        drawBtn(bx, 6, " Loop Off ", false)
+        bx = bx + drawBtn(bx, 6, " Loop Off ", false)
     elseif looping == 1 then
-        drawBtn(bx, 6, " Loop All ", true)
+        bx = bx + drawBtn(bx, 6, " Loop All ", true)
     else
-        drawBtn(bx, 6, " Loop One ", true)
+        bx = bx + drawBtn(bx, 6, " Loop One ", true)
+    end
+
+    -- Visualizer button (only when monitor detected)
+    monitor = findMonitor()
+    if monitor then
+        bx = bx + 1
+        drawBtn(bx, 6, " Viz:" .. viz_names[viz_mode + 1] .. " ", viz_mode > 0)
     end
 
     -- Volume slider (row 7)
@@ -321,13 +328,6 @@ function drawNowPlaying()
         term.write("Queue (" .. #queue .. ")")
     else
         term.write("Queue")
-    end
-
-    -- Visualizer button (only when monitor detected)
-    monitor = findMonitor()
-    if monitor then
-        local viz_label = " Viz:" .. viz_names[viz_mode + 1] .. " "
-        drawBtn(width - 21, 8, viz_label, viz_mode > 0)
     end
 
     local clear_label = " Clear "
@@ -892,28 +892,16 @@ function handleNowPlayingClick(button, x, y)
             shuffleQueue(); queue_scroll = 0; showToast("Queue shuffled")
             redrawScreen(); return
         end
-        -- Loop (x 23+)
-        if x >= 23 then
+        -- Loop (x 23..32)
+        if x >= 23 and x <= 32 then
             looping = (looping + 1) % 3
             redrawScreen(); return
         end
-    end
-
-    -- Volume (row 7)
-    if y == 7 and x >= 1 and x < 26 then
-        volume = (x - 1) / 24 * 3; redrawScreen(); return
-    end
-
-    -- Row 8 buttons
-    if y == 8 then
-        -- Viz button
-        monitor = findMonitor()
-        if monitor then
-            local viz_label = " Viz:" .. viz_names[viz_mode + 1] .. " "
-            local viz_x = width - 21
-            if x >= viz_x and x < viz_x + #viz_label then
+        -- Viz button (x 34+, only when monitor present)
+        if x >= 34 then
+            monitor = findMonitor()
+            if monitor then
                 viz_mode = (viz_mode + 1) % #viz_names
-                -- Reset viz state on change
                 viz_state.fire = nil
                 viz_state.rain_drops = {}
                 viz_state.rain_chars = {}
@@ -926,7 +914,15 @@ function handleNowPlayingClick(button, x, y)
                 redrawScreen(); return
             end
         end
+    end
 
+    -- Volume (row 7)
+    if y == 7 and x >= 1 and x < 26 then
+        volume = (x - 1) / 24 * 3; redrawScreen(); return
+    end
+
+    -- Row 8 buttons
+    if y == 8 then
         local clear_label = " Clear "
         local save_label = " Save "
         local clear_x = width - #clear_label
@@ -1843,6 +1839,15 @@ function httpLoop()
                     else
                         search_results = textutils.unserialiseJSON(body)
                         if not search_results then search_results = {} end
+                        -- Filter out promo/ad entries from server
+                        local filtered = {}
+                        for _, r in ipairs(search_results) do
+                            local name = (r.name or ""):lower()
+                            if not name:match("patreon") and not name:match("support this project") then
+                                table.insert(filtered, r)
+                            end
+                        end
+                        search_results = filtered
                     end
                     os.queueEvent("redraw_screen")
                 end
